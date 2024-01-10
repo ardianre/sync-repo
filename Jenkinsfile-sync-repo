@@ -1,0 +1,56 @@
+pipeline {
+    agent any
+
+    environment{
+        workdir='/home/test-sync-repo'
+        bitbucketRepo='bitbucket.org/ardianre-ws/sync-repo.git'
+        githubRepo='github.com/ardianre/sync-repo.git'
+    }
+
+    stages{
+        stage('Preparation') {
+            steps{
+                cleanWs()
+                sh """
+                    rm -rf ${workdir}
+                    rm -rf ${workdir}\\@tmp
+                    mkdir -p ${workdir}
+                """
+            }
+        }
+        stage('Sync Process') {
+            steps{
+                dir("${workdir}"){
+                    script{
+                        withCredentials([usernamePassword(
+                            credentialsId: 'ardianre-bitbucket',
+                            usernameVariable: 'BITBUCKET_USER',
+                            passwordVariable: 'BITBUCKET_PASS')]) {
+                                sh "git clone https://${BITBUCKET_USER}:${BITBUCKET_PASS}@${bitbucketRepo}"
+                                sh "pwd && ls -alrt"
+                            }
+                    }
+                }
+                dir("${workdir}/sync-repo") {
+                    script{
+                        withCredentials([usernamePassword(
+                            credentialsId: 'github-rendy-sync-repo',
+                            usernameVariable: 'GITHUB_USER',
+                            passwordVariable: 'GITHUB_PASS')]) {
+                                sh "pwd && ls -alrt"
+                                sh "git remote add github https://${GITHUB_USER}:${GITHUB_PASS}@${githubRepo}"
+                            }
+                        sh "git pull github main"
+                        sh "git remote -v"
+                        sh "git push -u github"
+                    }
+                }
+            }
+        }
+    }
+    post{
+        always{
+            cleanWs()
+        }
+    }
+}
