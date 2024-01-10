@@ -1,0 +1,117 @@
+def branch = params.Branch
+def service = params.Services
+def (repo_name, module_name)  = service.split('/')
+def env = params.Environment
+
+pipeline {
+    agent {
+        label 'fe-server'
+    }
+    tools {
+        jdk "java-8"
+    }
+    stages {
+        stage('Git Clone') {
+            steps {
+                sh "rm -rf /home/support/digipos/$repo_name"
+                sh """rm -rf /home/support/digipos/$repo_name\\@tmp"""
+                sh "mkdir -p /home/support/digipos/$repo_name"
+                dir("/home/support/digipos/$repo_name") {
+                    checkout([$class: 'GitSCM',
+                              branches: [[name: "${branch}"]],
+                              userRemoteConfigs: [[credentialsId: 'bitbucket_docker',
+                                                   url: "https://miftah@bitbucket.org/tsel/${repo_name}.git"]]])
+                }
+                script {
+                    currentBuild.displayName = "#${BUILD_NUMBER} $service"
+                }
+            }
+        }
+        stage('Build Jar') {
+            steps {
+                sshagent(['ssh_dev6']) {
+                    dir("/home/support/digipos/$repo_name") {
+                        sh 'chmod +x gradlew'
+                        sh "./gradlew :$module_name:clean bootJar"
+                    }
+                    dir ("/home/support/digipos/$repo_name/$module_name/build/libs/") {
+    					script {
+                            version_jar = sh (
+                                script: """ls -1 $module_name*.jar | awk -F"-" '{print \$NF}'""", returnStdout: true
+                            ).trim()
+                            version = sh (
+                                script: """ls -1 $module_name*.jar | awk -F"-" '{print \$NF}' | sed 's/.jar//g'""", returnStdout: true
+                                // script: """ls -1 *.jar | awk -F"-" '{print \$3}' | awk -F"_" '{print \$1}'""", returnStdout: true
+                            ).trim()
+                            currentBuild.displayName = "#${BUILD_NUMBER} $service $version.${BUILD_NUMBER}-ssl"
+                        }
+					}
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                sshagent(['ssh_dev6']) {
+                    dir("/home/support/digipos/$repo_name") {
+                        sh "echo ${version_jar}"
+                        withCredentials([file(credentialsId: 'tsel-coreca-cert', variable: 'tsel_core_ca'),
+                                         file(credentialsId: 'rabbitmq-client-key', variable: 'rabbitmq_client_key'),
+                                         file(credentialsId: 'rabbitmq-server-key', variable: 'rabbitmq_server_key'),
+                                         file(credentialsId: 'kafka2-client-keystore', variable: 'KAFKA_CLIENT_KEYSTORE'),
+                                         file(credentialsId: 'kafka2-client-truststore', variable: 'KAFKA_CLIENT_TRUSTSTORE'),
+                                         file(credentialsId: 'kafka-trustore-pre', variable: 'kafka_trustore_mb'),
+                                         file(credentialsId: 'kafka-cruiser-keystore-pre', variable: 'kafka_cruiser_keystore_mb'),
+                                         file(credentialsId: 'consul-ca-cert', variable: 'consul_ca_cert'),
+                                         file(credentialsId: 'certificate-esb', variable: 'ESB_CERT'),
+                                         file(credentialsId: 'ldap-cert', variable: 'LDAP_CERT')]) {
+                           sh "mkdir -p certs"
+                           sh "cp $tsel_core_ca certs/cacert.coreca.crt"
+                           sh "cp $rabbitmq_client_key certs/rabbitmq_client_key.p12"
+                           sh "cp $rabbitmq_server_key certs/rabbitmq_server_key.p12"
+                           sh "cp $consul_ca_cert certs/consul_ca_cert.pem"
+                           sh "cp $LDAP_CERT certs/ldap.cer"
+                           sh "cp $ESB_CERT certs/mashery.pem"
+                           sh "cp $KAFKA_CLIENT_KEYSTORE certs/kafka.client1.keystore.jks"
+                           sh "cp $KAFKA_CLIENT_TRUSTSTORE certs/kafka.client1.truststore.jks"
+                           sh "cp $kafka_trustore_mb certs/kafka.trustore.mb.jks"
+                           sh "cp $kafka_cruiser_keystore_mb certs/kafka.cruiser.keystore.mb.jks "
+                        }
+                        withCredentials([[
+                            $class: 'AmazonWebServicesCredentialsBinding',
+                            credentialsId: 'aws-preprod-credential-new-apps',
+                            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            sh "aws ecr get-login-password --region ap-southeast-3 | docker login --username AWS --password-stdin 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com"
+                            // sh """echo -e 'FROM 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-openjdk:8-jdk-alpine-base-tz\nCOPY certs/ /certs/\nRUN cd /opt/java/openjdk/jre/lib/security && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias ldapcert -file /certs/cacert.coreca.crt && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -import -alias consul-ca  -file /certs/consul_ca_cert.pem && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias ldapscert -file /certs/ldap.cer && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias esbcert -file /certs/mashery.pem && keytool -importkeystore -srckeystore /certs/rabbitmq_server_key.p12 -srcstoretype PKCS12 -srcstorepass c978D3B8!9d4#c?d -destkeystore /certs/rabbitmq_server_store.jks -deststorepass c978D3B8!9d4#c?d\nRUN apk add --no-cache mailcap\nRUN apk add curl\nARG name\nWORKDIR /\nCOPY $module_name/build/libs/$module_name-$version_jar app.jar' > Dockerfile"""
+                            sh """echo -e 'FROM 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-openjdk:8-jdk-alpine-base-tz\nCOPY certs/ /certs/\nRUN cd /opt/java/openjdk/jre/lib/security && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias ldapcert -file /certs/cacert.coreca.crt && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -import -alias consul-ca  -file /certs/consul_ca_cert.pem && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias ldapscert -file /certs/ldap.cer && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias esbcert -file /certs/mashery.pem && keytool -importkeystore -srckeystore /certs/rabbitmq_server_key.p12 -srcstoretype PKCS12 -srcstorepass c978D3B8!9d4#c?d -destkeystore /certs/rabbitmq_server_store.jks -deststorepass c978D3B8!9d4#c?d\nRUN apk add --no-cache mailcap\nRUN apk add curl\nARG name\nWORKDIR /\nCOPY $module_name/build/libs/*.jar app.jar' > Dockerfile"""
+                            sh "docker build --build-arg name=$module_name -t 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-$module_name:$version.${BUILD_NUMBER}-ssl ."
+                        }
+                    }
+                }
+            }
+        }
+        stage('Scan') {
+            steps {
+                // Scan the image
+                prismaCloudScanImage ca: '',
+                cert: '',
+                dockerAddress: 'unix:///var/run/docker.sock',
+                image: "181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-$module_name:$version.${BUILD_NUMBER}-ssl",
+                key: '',
+                logLevel: 'info',
+                podmanPath: '',
+                // The project field below is only applicable if you are using Prisma Cloud Compute Edition and have set up projects (multiple consoles) on Prisma Cloud.
+                project: '',
+                resultsFile: 'prisma-cloud-scan-results.json',
+                ignoreImageBuildTime:true
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+            prismaCloudPublish resultsFilePattern: 'prisma-cloud-scan-results.json'
+        }
+    }
+}
