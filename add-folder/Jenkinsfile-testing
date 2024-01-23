@@ -1,0 +1,427 @@
+def branch = params.Branch
+def service = params.Services
+def (repo_name, module_name)  = service.split('/')
+def env = params.Environment
+
+pipeline {
+    agent {
+        label 'fe-server'
+    }
+
+    environment {
+        scannerHome = tool 'sonar' // the name you have given the Sonar Scanner (in Global Tool Configuration)
+    }
+
+    tools {
+        jdk "java-17"
+    }
+    stages {
+        stage('Git Clone') {
+            steps {
+                sh "rm -rf /home/support/digipos/$repo_name"
+                sh """rm -rf /home/support/digipos/$repo_name\\@tmp"""
+                sh "mkdir -p /home/support/digipos/$repo_name"
+                dir("/home/support/digipos/$repo_name") {
+                    checkout([$class: 'GitSCM',
+                              branches: [[name: "${branch}"]],
+                              userRemoteConfigs: [[credentialsId: 'bitbucket_docker',
+                                                   url: "https://miftah@bitbucket.org/tsel/${repo_name}.git"]]])
+                }
+                script {
+                    currentBuild.displayName = "#${BUILD_NUMBER} $service"
+                }
+            }
+        }
+        stage('Build Jar') {
+            steps {
+                sshagent(['ssh_dev6']) {
+                    dir("/home/support/digipos/$repo_name/$module_name") {
+                        sh 'chmod +x gradlew'
+                        sh "./gradlew clean bootJar"
+                    }
+                    dir ("/home/support/digipos/$repo_name/$module_name/build/libs/") {
+    					script {
+                            version_jar = sh (
+                                script: """ls -1 $module_name*.jar | awk -F"-" '{print \$NF}'""", returnStdout: true
+                            ).trim()
+                            version = sh (
+                                script: """ls -1 $module_name*.jar | awk -F"-" '{print \$NF}' | sed 's/.jar//g'""", returnStdout: true
+                            ).trim()
+                            currentBuild.displayName = "#${BUILD_NUMBER} $service $version.${BUILD_NUMBER}"
+                        }
+					}
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                sshagent(['ssh_dev6']) {
+                    dir("/home/support/digipos/$repo_name") {
+                        sh "echo ${version_jar}"
+                        withCredentials([file(credentialsId: 'kafka2-client-keystore', variable: 'KAFKA_CLIENT_KEYSTORE'),
+                                         file(credentialsId: 'kafka2-client-truststore', variable: 'KAFKA_CLIENT_TRUSTSTORE'),
+                                         file(credentialsId: 'kafka-trustore-pre', variable: 'kafka_trustore_mb'),
+                                         file(credentialsId: 'kafka-cruiser-keystore-pre', variable: 'kafka_cruiser_keystore_mb'),
+                                         file(credentialsId: 'rabbitmq-client-key', variable: 'rabbitmq_client_key'),
+                                         file(credentialsId: 'rabbitmq-server-key', variable: 'rabbitmq_server_key'),
+                                         file(credentialsId: 'tsel-coreca-cert', variable: 'CORECA_CERT')]) {
+                           sh "mkdir -p certs"
+                           sh "cp $CORECA_CERT certs/coreca.pem"
+                           sh "cp $rabbitmq_client_key certs/rabbitmq_client_key.p12"
+                           sh "cp $rabbitmq_server_key certs/rabbitmq_server_key.p12"
+                           sh "cp $KAFKA_CLIENT_KEYSTORE certs/kafka.client1.keystore.jks"
+                           sh "cp $KAFKA_CLIENT_TRUSTSTORE certs/kafka.client1.truststore.jks"
+                           sh "cp $kafka_trustore_mb certs/kafka.trustore.mb.jks"
+                           sh "cp $kafka_cruiser_keystore_mb certs/kafka.cruiser.keystore.mb.jks "
+                        }
+                        withCredentials([[
+                            $class: 'AmazonWebServicesCredentialsBinding',
+                            credentialsId: 'aws-preprod-credential-new-apps',
+                            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            sh "aws ecr get-login-password --region ap-southeast-3 | docker login --username AWS --password-stdin 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com"
+                            sh """echo -e 'FROM 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-openjdk:17-jdk-alpine-base\nUSER root\nARG name\nWORKDIR /\nCOPY certs/ /certs/\nRUN cd /opt/openjdk-17/lib/security  && keytool -keystore cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias coreca -file /certs/coreca.pem && keytool -importkeystore -srckeystore /certs/rabbitmq_server_key.p12 -srcstoretype PKCS12 -srcstorepass c978D3B8!9d4#c?d -destkeystore /certs/rabbitmq_server_store.jks -deststorepass c978D3B8!9d4#c?d\nRUN apk add --no-cache mailcap\nRUN apk add curl\nCOPY $module_name/build/libs/*.jar app.jar' > Dockerfile"""
+                            sh "docker build --build-arg name=$module_name -t 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-$module_name:$version.$BUILD_NUMBER ."
+                        }
+                    }
+                }
+            }
+        }
+        stage("Push Image to ECR") {
+            steps {
+                sshagent(['ssh_dev6']) {
+                    dir("/home/support/digipos/$repo_name") {
+                        withCredentials([[
+                            $class: 'AmazonWebServicesCredentialsBinding',
+                            credentialsId: 'aws-preprod-credential-new-apps',
+                            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            sh "aws ecr get-login-password --region ap-southeast-3 | docker login --username AWS --password-stdin 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com"
+                            sh "docker push 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-$module_name:$version.$BUILD_NUMBER"
+                            sh "docker logout 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com"
+                            sh "docker rmi 181117862597.dkr.ecr.ap-southeast-3.amazonaws.com/digipos-$module_name:$version.$BUILD_NUMBER"
+                        }
+                    }
+                }
+            }
+        }
+        // stage("Update to CodeCommit") {
+        //     steps {
+        //         sshagent(['ssh_dev6']) {
+        //             script {
+        //                 if (params.Environment == 'preprod-1') {
+        //                     if ("${Service_Type}" == 'non-consumer' && "${module_name}" == 'physical-voucher') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-1-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-apps/deployment.yaml"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-upload/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add service-${module_name}-apps/deployment.yaml"
+        //                             sh "git add service-${module_name}-upload/deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else if ("${Service_Type}" == 'vf-consumer' && "${module_name}" == 'vf-consumer') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-1-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                     else {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-1-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "cat Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //                 else if (params.Environment == 'preprod-2') {
+        //                     if ("${Service_Type}" == 'non-consumer' && "${module_name}" == 'physical-voucher') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-2-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-apps/deployment.yaml"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-upload/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                         }
+        //                         dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add service-${module_name}-apps/deployment.yaml"
+        //                             sh "git add service-${module_name}-upload/deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+
+        //                         }
+        //                     }
+        //                     else if ("${Service_Type}" == 'vf-consumer' && "${module_name}" == 'vf-consumer') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-2-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                     else {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-2-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "cat Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //                 else if (params.Environment == 'preprod-3') {
+        //                     if ("${Service_Type}" == 'non-consumer' && "${module_name}" == 'physical-voucher') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-3-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-apps/deployment.yaml"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-upload/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add service-${module_name}-apps/deployment.yaml"
+        //                             sh "git add service-${module_name}-upload/deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else if ("${Service_Type}" == 'vf-consumer' && "${module_name}" == 'vf-consumer') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-3-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-3-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "cat Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //                 else if (params.Environment == 'preprod-4') {
+        //                     if ("${Service_Type}" == 'non-consumer' && "${module_name}" == 'physical-voucher') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-4-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-apps/deployment.yaml"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-upload/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add service-${module_name}-apps/deployment.yaml"
+        //                             sh "git add service-${module_name}-upload/deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else if ("${Service_Type}" == 'vf-consumer' && "${module_name}" == 'vf-consumer') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-4-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-4-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "cat Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //                 else {
+        //                     if ("${Service_Type}" == 'non-consumer' && "${module_name}" == 'physical-voucher') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-5-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-apps/deployment.yaml"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}-upload/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add service-${module_name}-apps/deployment.yaml"
+        //                             sh "git add service-${module_name}-upload/deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else if ("${Service_Type}" == 'vf-consumer' && "${module_name}" == 'vf-consumer') {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-5-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+
+        //                     else {
+        //                         dir("/home/support/digipos/$repo_name") {
+        //                             withCredentials([usernamePassword(credentialsId: 'aws-preprod-https', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        //                             {
+        //                                 sh "git clone --single-branch --branch preprod-5-new https://$USERNAME:$PASSWORD@git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/Digipos-Preprod-k8s-Configure"
+        //                                 sh "sed -i 's/digipos-${module_name}:.*/digipos-${module_name}:${version}.${BUILD_NUMBER}/g' Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "cat Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}/deployment.yaml"
+        //                                 sh "git status"
+        //                             }
+        //                             dir("/home/support/digipos/$repo_name/Digipos-Preprod-k8s-Configure/apps/preprod/service-${module_name}") {
+        //                             sh "git config user.email 'digipos-support@dansmultipro.com'"
+        //                             sh "git config user.name 'DigiPOS CI'"
+        //                             sh "git status"
+        //                             sh "git add deployment.yaml"
+        //                             sh """git commit -m 'update version image from branch ${Branch}'"""
+        //                             sh "git push"
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+    }
+    // post {
+    //     always {
+    //         cleanWs()
+    //     }
+    // }
+}
